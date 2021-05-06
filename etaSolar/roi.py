@@ -2,17 +2,31 @@ import pandas as pd
 import numpy as np
 from scipy.optimize import linprog
 from matplotlib import pyplot as plt
+from matplotlib import dates as mdates
 
 
-def dailyEssOpt(dailySmp, pcsCap, battCap):
-    c = -dailySmp
-    a_eq = np.ones([1, 24])
-    b_eq = battCap
+def dailyEssOpt(pv_to_opt, smp_to_opt, t_to_opt, soc0):
+    c = -smp_to_opt
+    A_eq = np.ones([1, t_to_opt]) / etaD / battCap
+    b_eq = (soc0 - socMin)/100
+    A_ub = np.zeros([2*t_to_opt, t_to_opt])
+    b_ub = np.zeros(2*t_to_opt)
+    for t in range(t_to_opt):
+        A_ub[t, :t + 1] = 1/etaD/battCap
+        b_ub[t] = (-socMin + soc0)/100
+        A_ub[t + t_to_opt, t] = 1
+        b_ub[t + t_to_opt] = 0.7 * pvCap - pv_to_opt[t]
+
     x_bounds = []
-    for k in range(24):
+    for k in range(t_to_opt):
         x_bounds.append((0, pcsCap))
-    res = linprog(c=c, A_eq=a_eq, b_eq=b_eq, bounds=x_bounds)
-    return res.x
+    res = linprog(c=c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=x_bounds)
+    dchgOpt = res.x
+    socOpt = np.zeros(t_to_opt)
+    for t in range(t_to_opt):
+        socOpt[t] = soc0 - (1 / etaD * dchgOpt[:t + 1]).sum() / battCap * 100
+    revOpt = smp_to_opt * dchgOpt
+    return dchgOpt, socOpt, revOpt
 
 
 def preprocessEtaSolarNetData(df, netIndex):
@@ -75,43 +89,73 @@ def preprocessEpsisData(df):
     return smp
 
 
-def socStabilizer(soc0, socB, pv):
-    if soc0 < socB:
-        return
-    t = 16
+def socStabilizer(socInit, socB, pv, smp_to_bal):
+    """
+    SOC 안정화를 수행하는 block
+    :param soc0: t=16 시점의 soc
+    :param socB: BMS가 soc balancing을 수행하는 최소 soc
+    :param pv: 해당 일의 pv 발전량 패턴. unit = Wh. time scale = 1h
+    :return:
+        dchg: 방전패턴
+        t: balancing 종료 후 시간
+        soc0: balancing 종료 후 soc
+    """
+    t = t_start
+    if socInit <= socB:
+        return [], t, []
     dchg = []
-    eTot = (soc0 - socB) * battCap * etaD / 100
-    print(eTot)
-    print(0.7*pvCap - pv[t])
+    socBal = []
+    eTot = (socInit - socB) * battCap * etaD / 100
     pMax = min(0.7*pvCap - pv[t], pcsCap)
-    while eTot >= pMax:
+    socTemp = socInit
+    if smp_to_bal[0] == np.sort(smp_to_bal)[-1] or smp_to_bal[0] == np.sort(smp_to_bal)[-2]:
         dchgTemp = pMax
-        print(dchgTemp)
         dchg.append(dchgTemp)
-        soc0 = soc0 - dchgTemp/etaD/battCap * 100
-        eTot = (soc0 - socB) * battCap * etaD / 100
+        socTemp = socTemp - dchgTemp/etaD/battCap * 100
+        socBal.append(socTemp)
+        eTot = (socTemp - socB) * battCap * etaD / 100
         t += 1
         pMax = min(0.7*pvCap - pv[t], pcsCap)
+        if eTot <= 0:
+            return dchg, t, socBal
+
+    while eTot >= pMax:
+        dchgTemp = pMax
+        dchg.append(dchgTemp)
+        socTemp = socTemp - dchgTemp/etaD/battCap * 100
+        socBal.append(socTemp)
+        eTot = (socTemp - socB) * battCap * etaD / 100
+        t += 1
+        pMax = min(0.7*pvCap - pv[t], pcsCap)
+        if t >= 24:
+            break
     dchgLast = eTot
     dchg.append(dchgLast)
+    soc0 = socTemp - dchgLast/etaD/battCap * 100
+    socBal.append(soc0)
     t += 1
-    soc0 = soc0 - dchgLast/etaD/battCap * 100
-    return dchg, t, soc0
+    return dchg, t, socBal
 
 
 if __name__ == "__main__":
+    # 데이터 입력 부분
     data = pd.read_excel('청명 20201001~31 데이터.xlsx', index_col=0, usecols="A,E:AB", engine='openpyxl')
     smp = pd.read_excel('시간별SMP 20201001~31.xlsx', index_col=0, usecols="A:Y", engine='openpyxl')
     dailySoc = [80.00, 70.90, 58.90, 75.70, 80.00, 80.00, 80.00, 79.90, 80.00, 80.00, 75.40,
                 80.00, 80.00, 80.00, 80.00, 59.50, 80.00, 80.00, 80.00, 80.00, 26.10, 37.40,
                 80.00, 80.00, 80.00, 79.90, 80.00, 80.00, 80.00, 80.00, 80.00]
-    socB = 40
+    socB = 70
+    socMin = 0
+    socMax = 80
+    t_start = 16
+    t_total = 4
     pvCap = 2747.52
     pcsCap = 2000
     battCap = 7488.24
-    etaC = 0.95
+    etaC = 0.9644
     etaD = 0.916
 
+    # 데이터 전처리 및 dataframe 생성
     netIndex = list(range(31))
     energyTable = preprocessEtaSolarNetData(data, netIndex)
     dchgIndex = list(range(31, 93, 2))
@@ -126,7 +170,73 @@ if __name__ == "__main__":
 
     energyTable['smp'] = preprocessEpsisData(smp)
 
-    [dchg, t0, soc0] = socStabilizer(80, socB, energyTable['pv']['2020-10-01'].values/1000)
+    # balancing
+    days_to_opt = len(dailySoc)
+    energyTable['dchg_opt'] = 0
+    energyTable['soc_opt'] = 0
+    energyTable['dchg_uniform'] = 0
+    energyTable['soc_uniform'] = 0
+    for d in range(days_to_opt):
+        socInit = dailySoc[d]
+        targetDate = energyTableDailySum.index[d].strftime('%Y-%m-%d')
+        pv_to_bal = energyTable['pv'][targetDate].values/1000
+        smp_to_bal = energyTable['smp'][targetDate].iloc[t_start:].values
+        [dchgBal, t0, socBal] = socStabilizer(socInit, socB, pv_to_bal, smp_to_bal)
+
+        t_to_opt = 24 - t0
+        pv_to_opt = pv_to_bal[t0:]
+        smp_to_opt = energyTable['smp'][targetDate].iloc[t0:].values
+        if socBal:
+            soc0 = socBal[-1]
+        else:
+            soc0 = socInit
+        [dchgOpt, socOpt, rev] = dailyEssOpt(pv_to_opt, smp_to_opt, t_to_opt, soc0)
+
+        dchg_daily_opt = np.append(dchgBal, dchgOpt)
+        soc_daily_opt = np.append(socBal, socOpt)
+        energyTable.loc[:, 'dchg_opt'].iloc[d*24+t_start:(d+1)*24] = dchg_daily_opt * \
+                                                                     energyTable['essD'][f'2020-10-{d+1}'].sum() \
+                                                                     / dchg_daily_opt.sum()
+        energyTable.loc[:, 'soc_opt'].iloc[d*24+t_start:(d+1)*24] = soc_daily_opt
+        energyTable.loc[:, 'soc_opt'].iloc[d*24 + 15] = energyTableDailySum['soc'].iloc[d]
+
+        eTot = socInit * battCap * etaD * 10
+        dchg_daily_uniform = np.zeros(t_total)
+        dchg_daily_uniform = dchg_daily_uniform + eTot/t_total
+        soc_daily_uniform = []
+        for t in range(t_total):
+            soc_daily_uniform.append(socInit - t*eTot/t_total/etaD/battCap/10)
+        energyTable.loc[:, 'dchg_uniform'].iloc[d*24+t_start+2:(d+1)*24-2] = dchg_daily_uniform
+        energyTable.loc[:, 'soc_uniform'].iloc[d*24+t_start+2:(d+1)*24-2] = soc_daily_uniform
+
+    energyTable['rev_etaSolar'] = energyTable['smp'] * energyTable['essD'] / 1000
+    energyTable['rev_opt'] = energyTable['smp'] * energyTable['dchg_opt'] / 1000
+    energyTable['rev_uniform'] = energyTable['smp'] * energyTable['dchg_uniform'] / 1000
+
+    energyTableDailySum.index = energyTableDailySum.index.to_series().dt.date
+    energyTableDailySum[['essD', 'essC']].plot(kind='bar')
+    plt.show()
+
+    date_to_plot = '2020-10-16'
+
+    myFmt = mdates.DateFormatter('%d:%H')
+    f, axarr = plt.subplots(4)
+    axarr[1].set_ylim(0,pcsCap)
+    energyTable['smp'].loc[date_to_plot].plot(legend=True, style='r', marker='o', ax=axarr[0])
+    (energyTable['essD']/1000).loc[date_to_plot].plot(ax=axarr[1], kind='bar', legend=True).xaxis.set_major_formatter(myFmt)
+    (energyTable['dchg_opt']/1000).loc[date_to_plot].plot(ax=axarr[2], kind='bar', legend=True).xaxis.set_major_formatter(myFmt)
+    energyTable['soc_opt'].loc[date_to_plot].plot(ax=axarr[3], style='y', legend=True).xaxis.set_major_formatter(myFmt)
+    plt.show()
+
+    (energyTable['pv']/1000).loc[date_to_plot].plot(legend=True, color='red', kind='bar').xaxis.set_major_formatter(myFmt)
+    plt.show()
+
+    print(f'Total revenue with etaSolar ESS: {energyTable["rev_etaSolar"].sum()}')
+    print(f'Total revenue with optimized ESS: {energyTable["rev_opt"].sum()}')
+    print(f'Total increased revenue [KRW]: {energyTable["rev_opt"].sum() - energyTable["rev_etaSolar"].sum()}')
+    print(f'Total increased revenue [%]: {(energyTable["rev_opt"].sum() - energyTable["rev_etaSolar"].sum()) / energyTable["rev_etaSolar"].sum() * 100}')
+
+
 
     # energyTable['ess_uniform'] = [pcsCap if 17 <= h < 17 + battCap / pcsCap else 0 for h in energyTable.index.hour]
     # energyTable['revenue_uniform'] = energyTable['smp'] * energyTable['ess_uniform']
